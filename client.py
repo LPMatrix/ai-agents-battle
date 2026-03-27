@@ -1,10 +1,15 @@
 import json
+import time
 from typing import Any
 
 import httpx
 
+# Hosted MCP can stall; default httpx read timeout is easy to hit under load.
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=20.0, read=180.0, write=60.0, pool=30.0)
+_CALL_RETRIES = 4
+_RETRY_BACKOFF_S = 2.0
+
 BASE_URL = "https://battle-tank-arena.vercel.app/api/mcp"
-TANK_NAME = "Matrix"
 
 # Streamable HTTP transport (see mcp.client.streamable_http)
 _ACCEPT = "application/json, text/event-stream"
@@ -12,15 +17,28 @@ _INIT_PROTOCOL_VERSION = "2025-03-26"
 
 
 class MCPClient:
-    """Minimal synchronous MCP Streamable HTTP client."""
+    """Minimal synchronous MCP Streamable HTTP client.
 
-    def __init__(self) -> None:
-        self._http = httpx.Client(timeout=60.0)
+    One client instance controls one tank: ``tank_name`` is sent as
+    ``x-player-token`` and to ``register``. Run separate processes for
+    multiple tanks.
+    """
+
+    def __init__(self, tank_name: str) -> None:
+        name = tank_name.strip()
+        if not name:
+            raise ValueError("tank_name must be non-empty")
+        self._tank_name = name
+        self._http = httpx.Client(timeout=_DEFAULT_TIMEOUT)
         self._session_id: str | None = None
         self._protocol_version: str | None = None
         self._next_id = 0
-        self._extra_headers = {"x-player-token": TANK_NAME}
+        self._extra_headers = {"x-player-token": self._tank_name}
         self._initialized = False
+
+    @property
+    def tank_name(self) -> str:
+        return self._tank_name
 
     def close(self) -> None:
         self._http.close()
@@ -123,15 +141,28 @@ class MCPClient:
             },
             "id": self._rpc_id(),
         }
-        response = self._http.post(BASE_URL, json=payload, headers=self._headers())
-        response.raise_for_status()
-        body = self._parse_jsonrpc_response(response)
-        if body.get("error"):
-            raise RuntimeError(body["error"])
-        return body.get("result") or body
+        for attempt in range(_CALL_RETRIES):
+            try:
+                response = self._http.post(BASE_URL, json=payload, headers=self._headers())
+                response.raise_for_status()
+                body = self._parse_jsonrpc_response(response)
+                if body.get("error"):
+                    raise RuntimeError(body["error"])
+                return body.get("result") or body
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as e:
+                if attempt < _CALL_RETRIES - 1:
+                    delay = _RETRY_BACKOFF_S * (attempt + 1)
+                    print(
+                        f"[mcp] {type(e).__name__} on {tool!r} "
+                        f"(attempt {attempt + 1}/{_CALL_RETRIES}), retry in {delay:.0f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
 
     def register(self) -> dict[str, Any]:
-        return self._call("register", {"name": TANK_NAME})
+        return self._call("register", {"name": self._tank_name})
 
     def get_valid_actions(self) -> dict[str, Any]:
         return self._call("get_valid_actions")
